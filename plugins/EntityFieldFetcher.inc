@@ -6,46 +6,32 @@
  */
 
 /**
- * Definition of the import batch object created on the fetching stage by
- * FeedsFileFetcher.
+ * Fetches data via file field attached to an entity.
  */
-class FeedsFileFetcherResult extends FeedsFetcherResult {
-  /**
-   * Constructor.
-   */
-  public function __construct($file_path) {
-    parent::__construct('');
-    $this->file_path = $file_path;
-  }
-
-  /**
-   * Overrides parent::getRaw();
-   */
-  public function getRaw() {
-    return $this->sanitizeRaw(file_get_contents($this->file_path));
-  }
-
-  /**
-   * Overrides parent::getFilePath().
-   */
-  public function getFilePath() {
-    if (!file_exists($this->file_path)) {
-      throw new Exception(t('File @filepath is not accessible.', array('@filepath' => $this->file_path)));
-    }
-    return $this->sanitizeFile($this->file_path);
-  }
-}
-
-/**
- * Fetches data via HTTP.
- */
-class FeedsFileFetcher extends FeedsFetcher {
+class EntityFieldFetcher extends FeedsFetcher {
 
   /**
    * Implements FeedsFetcher::fetch().
    */
   public function fetch(FeedsSource $source) {
     $source_config = $source->getConfigFor($this);
+    $field = $this->config['file_field'];
+
+    if (db_table_exists('field_data_' . $field )) {
+      $table = '{field_data_' . $field . '}';
+      $id = $field . '_fid';
+      $fid = db_query("SELECT $id FROM $table WHERE entity_id = :feed_nid", array(':feed_nid' => $source->feed_nid))->fetchField();
+      if ($fid) {
+        $file = file_load($fid);
+        return new FeedsFileFetcherResult($file->uri);
+
+      }
+    }
+
+    // Might have to look up file from field here!
+    //
+    // Nope, will have the field, just need to grab the file.
+
 
     // Just return a file fetcher result if this is a file.
     if (is_file($source_config['source'])) {
@@ -92,40 +78,6 @@ class FeedsFileFetcher extends FeedsFetcher {
   }
 
   /**
-   * Source form.
-   */
-  public function sourceForm($source_config) {
-    $form = array();
-    $form['fid'] = array(
-      '#type' => 'value',
-      '#value' => empty($source_config['fid']) ? 0 : $source_config['fid'],
-    );
-    if (empty($this->config['direct'])) {
-      $form['source'] = array(
-        '#type' => 'value',
-        '#value' => empty($source_config['source']) ? '' : $source_config['source'],
-      );
-      $form['upload'] = array(
-        '#type' => 'file',
-        '#title' => empty($this->config['direct']) ? t('File') : NULL,
-        '#description' => empty($source_config['source']) ? t('Select a file from your local system.') : t('Select a different file from your local system.'),
-        '#theme' => 'feeds_upload',
-        '#file_info' => empty($source_config['fid']) ? NULL : file_load($source_config['fid']),
-        '#size' => 10,
-      );
-    }
-    else {
-      $form['source'] = array(
-        '#type' => 'textfield',
-        '#title' => t('File'),
-        '#description' => t('Specify a path to a file or a directory. Path must start with @scheme://', array('@scheme' => file_default_scheme())),
-        '#default_value' => empty($source_config['source']) ? '' : $source_config['source'],
-      );
-    }
-    return $form;
-  }
-
-  /**
    * Override parent::sourceFormValidate().
    */
   public function sourceFormValidate(&$values) {
@@ -158,6 +110,9 @@ class FeedsFileFetcher extends FeedsFetcher {
   public function sourceSave(FeedsSource $source) {
     $source_config = $source->getConfigFor($this);
 
+    // Need to look if file is present, then add to source?
+    //
+
     // If a new file is present, delete the old one and replace it with the new
     // one.
     if (isset($source_config['file'])) {
@@ -176,22 +131,11 @@ class FeedsFileFetcher extends FeedsFetcher {
   }
 
   /**
-   * Override parent::sourceDelete().
-   */
-  public function sourceDelete(FeedsSource $source) {
-    $source_config = $source->getConfigFor($this);
-    if (isset($source_config['fid'])) {
-      $this->deleteFile($source_config['fid'], $source->feed_nid);
-    }
-  }
-
-  /**
    * Override parent::configDefaults().
    */
   public function configDefaults() {
     return array(
-      'allowed_extensions' => 'txt csv tsv xml opml',
-      'direct' => FALSE,
+      'file_field' => FALSE,
     );
   }
 
@@ -200,30 +144,27 @@ class FeedsFileFetcher extends FeedsFetcher {
    */
   public function configForm(&$form_state) {
     $form = array();
-    $form['allowed_extensions'] = array(
-      '#type' => 'textfield',
-      '#title' => t('Allowed file extensions'),
-      '#description' => t('Allowed file extensions for upload.'),
-      '#default_value' => $this->config['allowed_extensions'],
-    );
-    $form['direct'] = array(
-      '#type' => 'checkbox',
-      '#title' => t('Supply path to file or directory directly'),
-      '#description' => t('For experts. Lets users specify a path to a file <em>or a directory of files</em> directly,
-        instead of a file upload through the browser. This is useful when the files that need to be imported
-        are already on the server.'),
-      '#default_value' => $this->config['direct'],
-    );
-    return $form;
-  }
-
-  /**
-   * Helper. Deletes a file.
-   */
-  protected function deleteFile($fid, $feed_nid) {
-    if ($file = file_load($fid)) {
-      file_usage_delete($file, 'feeds', get_class($this), $feed_nid);
-      file_delete($file);
+    if ($content_type = feeds_importer($this->id)->config['content_type']) {
+      $fields = field_info_instances('node', $content_type);
+      $options = array(
+        '' => t('- Select a file field -'),
+      );
+      foreach ($fields as $field_id => $field_info) {
+        $options[$field_id] = $field_info['label'];
+      }
+      $form['file_field'] = array(
+        '#type' => 'select',
+        '#options' => $options,
+        '#default_value' => $this->config['file_field'],
+        '#title' => t('File Field'),
+        '#description' => t('Select which file field to use as the source of your data.'),
+      );
     }
+    else {
+      $form['no_content_type'] = array(
+        '#markup' => t('You must select a content type in Basic Settings.'),
+      );
+    }
+    return $form;
   }
 }

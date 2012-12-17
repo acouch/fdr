@@ -8,44 +8,48 @@
 /**
  * Creates simple table records from feed items. Uses Data module.
  */
-class FeedsDataProcessor extends FeedsProcessor {
+class FieldDataProcessor extends FeedsProcessor {
+
+  // We aren't creating or updating entities, just table records.
+  // So these are empty.
+  public function entityType() {}
+  protected function newEntity(FeedsSource $source) {}
+  protected function entitySave($entity) {}
+  protected function entityDeleteMultiple($entity_ids) {}
 
   /**
    * Implementation of FeedsProcessor::process().
    */
-  public function process(FeedsImportBatch $batch, FeedsSource $source) {
-
+  public function process(FeedsSource $source, FeedsParserResult $parser_result) {
     // Count number of created and updated nodes.
     $inserted  = $updated = 0;
     $expiry_time = $this->expiryTime();
+    $this->feed_nid = $source->feed_nid;
 
-    while ($item = $batch->shiftItem()) {
-      $id = $this->existingItemId($batch, $source);
+    $schema = $this->fullSchema($this->dataSchema($parser_result->items[0]));
+    $table = $this->table($schema);
 
-      if ($id === FALSE || $this->config['update_existing']) {
-        // Map item to a data record, feed_nid and timestamp are mandatory.
-        $data = array();
-        $data['feed_nid'] = $source->feed_nid;
-        $data = $this->map($batch, $data);
-        if (!isset($data['timestamp'])) {
-          $data['timestamp'] = FEEDS_REQUEST_TIME;
-        }
+    while ($data = $parser_result->shiftItem()) {
+      $data['feed_entity_id'] = $this->feed_nid;
+      if (!isset($data['timestamp'])) {
+        $data['timestamp'] = FEEDS_REQUEST_TIME;
+      }
 
-        // Only save if this item is not expired.
-        if ($expiry_time != FEEDS_EXPIRE_NEVER && $data['timestamp'] < (FEEDS_REQUEST_TIME - $expiry_time)) {
-          continue;
-        }
-
-        // Save data.
-        if ($id !== FALSE) {
-          $data['id'] = $id;
-          $this->handler()->update($data, 'id');
-          $updated++;
-        }
-        else {
-          $this->handler()->insert($data);
-          $inserted++;
-        }
+      // Only save if this item is not expired.
+      if ($expiry_time != FEEDS_EXPIRE_NEVER && $data['timestamp'] < (FEEDS_REQUEST_TIME - $expiry_time)) {
+        continue;
+      }
+      // Not sure if this id will work.
+      // Id is serial in the db_table, so update maybe best determined by row number.
+      $id = $this->existingItemId($parser_result, $source);
+      if ($id != FALSE || $this->config['update_existing']) {
+        $data['id'] = $id;
+        $this->handler()->update($data, 'id');
+        $updated++;
+      }
+      else {
+        $this->handler()->save($data);
+        $inserted++;
       }
     }
 
@@ -64,11 +68,11 @@ class FeedsDataProcessor extends FeedsProcessor {
   /**
    * Implementation of FeedsProcessor::clear().
    *
-   * Delete all data records for feed_nid in this table.
+   * Delete all data records for feed_entity_id in this table.
    */
   public function clear(FeedsBatch $batch, FeedsSource $source) {
     $clause = array(
-      'feed_nid' => $source->feed_nid,
+      'feed_entity_id' => $source->feed_entity_id,
     );
     $num = $this->handler()->delete($clause);
     if ($num) {
@@ -105,69 +109,6 @@ class FeedsDataProcessor extends FeedsProcessor {
    */
   public function expiryTime() {
     return $this->config['expire'];
-  }
-
-  /**
-   * Return available mapping targets.
-   */
-  public function getMappingTargets() {
-    $schema = $this->table()->get('table_schema');
-    $meta = $this->table()->get('meta');
-
-    // Collect all existing fields except id and field_nid and offer them as
-    // mapping targets.
-    $existing_fields = $new_fields = array();
-    if (isset($schema['fields'])) {
-      foreach ($schema['fields'] as $field_name => $field) {
-        if (!in_array($field_name, array('id', 'feed_nid'))) {
-          // Any existing field can be optionally unique.
-          // @todo Push this reverse mapping of spec to short name into data
-          // module.
-          $type = $field['type'];
-          if ($type == 'int' && $field['unsigned']) {
-            $type = 'unsigned int';
-          }
-          $existing_fields[$field_name] = array(
-            'name' => empty($meta['fields'][$field_name]['label']) ? $field_name : $meta['fields'][$field_name]['label'],
-            'description' => t('Field of type !type.', array('!type' => $type)),
-            'optional_unique' => TRUE,
-          );
-        }
-      }
-    }
-
-    // Do the same for every joined table.
-    foreach ($this->handler()->joined_tables as $table) {
-      $schema = data_get_table($table)->get('table_schema');
-      if (isset($schema['fields'])) {
-        foreach ($schema['fields'] as $field_name => $field) {
-          if (!in_array($field_name, array('id', 'feed_nid'))) {
-            // Fields in joined tables can't be unique.
-            $type = $field['type'];
-            if ($type == 'int' && $field['unsigned']) {
-              $type = 'unsigned int';
-            }
-            $existing_fields["$table.$field_name"] = array(
-              'name' => $table .'.'. (empty($meta['fields'][$field_name]['label']) ? $field_name : $meta['fields'][$field_name]['label']),
-              'description' => t('Joined field of type !type.', array('!type' => $type)),
-              'optional_unique' => FALSE,
-            );
-          }
-        }
-      }
-    }
-
-    // Now add data field types as mapping targets.
-    $field_types = drupal_map_assoc(array_keys(data_get_field_definitions()));
-    foreach ($field_types as $k => $v) {
-      $new_fields['new:'. $k] = array(
-        'name' => t('[new] !type', array('!type' => $v)),
-        'description' => t('Creates a new column of type !type.', array('!type' => $v)),
-      );
-    }
-    $fields = $new_fields + $existing_fields;
-    drupal_alter('feeds_data_processor_targets', $fields, $this->table()->get('name'));
-    return $fields;
   }
 
   /**
@@ -217,9 +158,9 @@ class FeedsDataProcessor extends FeedsProcessor {
    * Iterate through unique targets and try to load existing records.
    * Return id for the first match.
    */
-  protected function existingItemId(FeedsImportBatch $batch, FeedsSource $source) {
-    foreach ($this->uniqueTargets($batch) as $target => $value) {
-      if ($records = $this->handler()->load(array('feed_nid' => $source->feed_nid, $target => $value))) {
+  protected function existingItemId(FeedsParserResult $parser_result, FeedsSource $source) {
+    foreach ($this->uniqueTargets($source, $parser_result) as $target => $value) {
+      if ($records = $this->handler()->load(array('feed_entity_id' => $source->feed_entity_id, $target => $value))) {
         return $records[0]['id'];
       }
     }
@@ -256,13 +197,6 @@ class FeedsDataProcessor extends FeedsProcessor {
       '#description' => t('If an existing record is found for an imported record, replace it. Existing records will be determined using mappings that are a "unique target".'),
       '#default_value' => $this->config['update_existing'],
     );
-    $form['delete_with_source'] = array(
-      '#type' => 'checkbox',
-      '#title' => t('Delete items with source'),
-      '#description' => t('If enabled, any feed items associated with a source node will be removed along with the node. Not available for standalone importers.'),
-      '#default_value' => $this->config['delete_with_source'],
-      '#disabled' => empty(feeds_importer($this->id)->config['content_type']) ? TRUE : FALSE,
-    );
     return $form;
   }
 
@@ -280,7 +214,7 @@ class FeedsDataProcessor extends FeedsProcessor {
    * Return the data table name for this feed.
    */
   protected function tableName() {
-    return variable_get('feeds_data_'. $this->id, 'feeds_data_'. $this->id);
+    return 'dkan_datastore_' . $this->feed_nid;
   }
 
   /**
@@ -292,12 +226,12 @@ class FeedsDataProcessor extends FeedsProcessor {
    * @todo Make *Data module* throw exception when table can't be found or
    *   can't be created.
    */
-  protected function table() {
+  protected function table($schema) {
     if ($table = data_get_table($this->tableName())) {
       return $table;
     }
     else {
-      if ($table = data_create_table($this->tableName(), $this->baseSchema(), feeds_importer($this->id)->config['name'])) {
+      if ($table = data_create_table($this->tableName(), $schema)) {
         return $table;
       }
     }
@@ -310,9 +244,35 @@ class FeedsDataProcessor extends FeedsProcessor {
    * Avoids a call to table() to not unnecessarily instantiate DataTable.
    */
   protected function handler() {
-    data_include('DataHandler');
-    feeds_include('FeedsDataHandler');
-    return FeedsDataHandler::instance($this->tableName(), 'id');
+    fdr_include('DataHandler');
+    feeds_include_library('FeedsDataHandler');
+    return DataHandler::instance($this->tableName(), 'id');
+  }
+
+
+  /**
+   * At some point we might want to determine best field type in
+   * the database by the type of content in the first row of each.
+   * This is difficult because PHP thinks everything is a string.
+   */
+  function dataSchema($first_row) {
+    foreach ($first_row as $field => $data) {
+      $data_schema[$field] = data_get_field_definition('bigtext');
+    }
+    return $data_schema;
+  }
+
+  /**
+   * Creates full schema from baseSchema and an array.
+   *
+   *  @param array data
+   *  Arrway with keys for each desired row.
+   */
+  function fullSchema($data) {
+    $base = $this->baseSchema();
+    $data_schema = data_build_schema($data);
+    $base['fields'] = array_merge($data_schema['fields'], $base['fields']);
+    return $base;
   }
 
   /**
@@ -321,11 +281,6 @@ class FeedsDataProcessor extends FeedsProcessor {
   protected function baseSchema() {
     return array(
       'fields' => array(
-        'feed_nid' => array(
-          'type' => 'int',
-          'unsigned' => TRUE,
-          'not null' => TRUE,
-        ),
         'id' => array(
           'type' => 'serial',
           'size' => 'normal',
@@ -340,7 +295,6 @@ class FeedsDataProcessor extends FeedsProcessor {
         ),
       ),
       'indexes' => array(
-        'feed_nid' => array('feed_nid'),
         'id' => array('id'),
         'timestamp' => array('timestamp'),
        ),
@@ -350,48 +304,4 @@ class FeedsDataProcessor extends FeedsProcessor {
     );
   }
 
-  /**
-   * Override parent::addConfig().
-   */
-  public function addConfig($config) {
-    $this->processMappings($config);
-    return parent::addConfig($config);
-  }
-
-  /**
-   * Override parent::setConfig().
-   */
-  public function setConfig($config) {
-    $this->processMappings($config);
-    return parent::setConfig($config);
-  }
-
-  /**
-   * Create a new field for each new: mapping.
-   */
-  protected function processMappings(&$config) {
-    if (!empty($config['mappings'])) {
-      foreach ($config['mappings'] as &$mapping) {
-        @list($new, $type) = explode(':', $mapping['target']);
-
-        // Create a new field with targets that start with "new:"
-        if ($new == 'new') {
-          // Build a field name from the source key.
-          $field_name = data_safe_name($mapping['source']);
-          // Get the full schema spec from data.
-          $type = data_get_field_definition($type);
-          // Add the field to the table.
-          $schema = $this->table()->get('table_schema');
-          if (!isset($schema['fields'][$field_name])) {
-            $mapping['target'] = $this->table()->addField($field_name, $type);
-            // Let the user know.
-            drupal_set_message(t('Created new field "@name".', array('@name' => $field_name)));
-          }
-          else {
-            throw new Exception(t('Field @field_name already exists as a mapping target. Remove it from mapping if you would like to map another source to it. Remove it from !data_table table if you would like to change its definition.', array('@field_name' => $field_name, '!data_table' => l($this->table()->get('name'), 'admin/content/data'))));
-          }
-        }
-      }
-    }
-  }
 }

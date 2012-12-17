@@ -30,14 +30,14 @@ function fdr_ctools_plugin_type() {
 /**
  * Implements hook_feeds_plugins().
  */
-function fdr_data_plugins() {
+function fdr_feeds_plugins() {
   $path = drupal_get_path('module', 'fdr') . '/plugins';
 
   return array(
     'FieldDataProcessor' => array(
       'name' => 'Field Data Processor',
       'description' => 'Imports source data into unique database tables identified by the entity id they are attached to.',
-      'help' => 'See description.',
+      'help' => 'Imports source data into unique database tables identified by the entity id they are attached to.',
       'handler' => array(
         'parent' => 'FeedsProcessor',
         'class' => 'FieldDataProcessor',
@@ -48,7 +48,7 @@ function fdr_data_plugins() {
     'EntityFieldFetcher' => array(
       'name' => 'Entity Field Fetcher',
       'description' => 'Fetches records from a field attached to an entity.',
-      'help' => 'See description.',
+      'help' => 'Fetches records from a field attached to an entity.',
       'handler' => array(
         'parent' => 'FeedsFileFetcher',
         'class' => 'EntityFieldFetcher',
